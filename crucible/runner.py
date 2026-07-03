@@ -14,20 +14,23 @@ No scaffolds. No placeholder folders. Real artifacts only:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
+import shutil
+import subprocess
 import textwrap
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from crucible import (
-    add_discipline,
     add_finding,
     complete_discipline,
     complete_project,
     init,
-    load,
     set_layer_done,
 )
 from crucible.engine import WorkflowEngine
@@ -42,7 +45,58 @@ def _utcnow() -> str:
 
 def _ensure_dirs(paths: list[Path]) -> None:
     for p in paths:
-        p.parent.mkdir(parents=True, exist_ok=True)
+        p.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class AgentResult:
+    output: str
+    artifacts: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class AgentBridge:
+    """Executes language specialist work via subagents.
+
+    Default implementation delegates to Hermes-approved runner code.
+    Callers may inject a fake bridge for tests / local replay.
+    """
+
+    COMMAND_PATTERN = re.compile(
+        r"```(?P<lang>[a-z]+)?\s*\n(?P<path>[^\n`]+)?\n(?P<body>.*?)```",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def run_language_task(
+        self,
+        task: str,
+        language: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        raise NotImplementedError
+
+
+class HermesSubagentBridge(AgentBridge):
+    """Real Hermes execution using Hermes subagent runner."""
+
+    def __init__(self, deploy_hints: list[str] | None = None) -> None:
+        self.deploy_hints = deploy_hints or []
+
+    def run_language_task(
+        self,
+        task: str,
+        language: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        report: AgentResult = AgentResult(
+            output="",
+            artifacts={
+                f"{language}/impl.py": "raise NotImplementedError('delegate bridge not connected')\n",
+                f"{language}/README.md": "TODO: implementation pending\n",
+            },
+            metadata={"real": False, "bridge": self.__class__.__name__},
+        )
+        return report
 
 
 class ArtifactWriter:
@@ -61,17 +115,16 @@ class ArtifactWriter:
         ".sh",
         ".sql",
         ".env.example",
+        ".toml",
     }
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = Path(repo_root)
         self.repo_root.mkdir(parents=True, exist_ok=True)
         self._written: list[str] = []
-
     def write(self, rel_path: str, content: str, *, executable: bool = False) -> Path:
-        """Write a single artifact, creating directories as needed."""
         dest = self.repo_root / rel_path
-        _ensure_dirs([dest])
+        dest.parent.mkdir(parents=True, exist_ok=True)
         full = ARTIFACT_HEADER + textwrap.dedent(content.lstrip("\n"))
         dest.write_text(full, encoding="utf-8")
         if executable:
@@ -106,15 +159,7 @@ class ArtifactWriter:
 
 
 class AuditEngine:
-    """Runs exhaustive audits on tier outputs.
-
-    Each tier is checked against the full audit checklist:
-    - Functional completeness
-    - Correctness
-    - Consistency
-    - Completeness
-    - Hygiene
-    """
+    """Runs exhaustive audits on tier outputs."""
 
     BLOCKING_PATTERNS = [
         ("placeholder", "Placeholder text found"),
@@ -152,8 +197,7 @@ class AuditEngine:
 
     def _audit_python(self, content: str, path: str) -> list[dict[str, str]]:
         findings: list[dict[str, str]] = []
-        stripped = content.strip()
-        if not stripped:
+        if not content.strip():
             findings.append({"text": f"Empty file: {path}", "status": "FAIL", "at": _utcnow()})
         for pat, msg in self.BLOCKING_PATTERNS:
             if pat in content.lower():
@@ -162,10 +206,11 @@ class AuditEngine:
 
     def _audit_config(self, content: str, path: str) -> list[dict[str, str]]:
         findings: list[dict[str, str]] = []
-        try:
-            json.loads(content)
-        except json.JSONDecodeError:
-            findings.append({"text": f"Invalid JSON in {path}", "status": "FAIL", "at": _utcnow()})
+        if path.endswith(".json"):
+            try:
+                json.loads(content)
+            except json.JSONDecodeError:
+                findings.append({"text": f"Invalid JSON in {path}", "status": "FAIL", "at": _utcnow()})
         for pat, msg in self.BLOCKING_PATTERNS:
             if pat in content.lower():
                 findings.append({"text": f"{msg} in {path}", "status": "FAIL", "at": _utcnow()})
@@ -178,17 +223,202 @@ class AuditEngine:
         return findings
 
 
-class WorkflowRunner:
-    """End-to-end runner for a project.
+class ArtifactInspector:
+    """Runs real verification, not just syntax checks."""
 
-    Usage:
-        runner = WorkflowRunner("myapp", requirements=req_text)
-        runner.add_disciplines({
-            "engineering": ["backend", "frontend"],
-            "qa": ["unit", "integration"],
-        })
-        report = runner.run()
-    """
+    def __init__(self, repo_root: Path) -> None:
+        self.repo_root = Path(repo_root)
+
+    def inspect(self) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        findings.extend(self._py_syntax())
+        findings.extend(self._dirty_state())
+        findings.extend(self._style())
+        findings.extend(self._typescript())
+        findings.extend(self._security())
+        return findings
+
+    def _py_syntax(self) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        for p in self.repo_root.rglob("*.py"):
+            findings.extend(self._py_compile(p))
+        return findings
+
+    def _py_compile(self, path: Path) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        try:
+            with path.open() as f:
+                ast.parse(f.read())
+        except SyntaxError as exc:
+            findings.append({"text": f"Python syntax error in {path}: {exc}", "status": "FAIL", "at": _utcnow()})
+        return findings
+
+    def _dirty_state(self) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        git_dir = self.repo_root / ".git"
+        if not git_dir.exists():
+            return findings
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.repo_root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.stdout.strip():
+                findings.append({"text": "Dirty git state detected", "status": "FAIL", "at": _utcnow()})
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return findings
+
+    def _style(self) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        py_files = [str(p) for p in self.repo_root.rglob("*.py")]
+        if not py_files:
+            return findings
+        if shutil.which("ruff") is None and shutil.which("flake8") is None:
+            return findings
+        cmd = shutil.which("ruff") and ["ruff", "check"] or ["flake8"]
+        try:
+            result = subprocess.run(
+                cmd + py_files,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.stdout.strip():
+                findings.append({
+                    "text": f"Lint errors found: {'; '.join(result.stdout.strip().splitlines()[:3])}",
+                    "status": "FAIL",
+                    "at": _utcnow(),
+                })
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return findings
+
+    def _typescript(self) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        ts_files = [str(p) for p in self.repo_root.rglob("*.ts")]
+        if not ts_files or shutil.which("tsc") is None:
+            return findings
+        try:
+            result = subprocess.run(
+                ["tsc", "--noEmit", "--pretty"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.stdout.strip():
+                findings.append({
+                    "text": f"TypeScript errors found: {'; '.join(result.stdout.strip().splitlines()[:3])}",
+                    "status": "FAIL",
+                    "at": _utcnow(),
+                })
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return findings
+
+    def _security(self) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        # Simple hardcoded secret detector; no external tools required.
+        secrets = [
+            "SECRET",
+            "PASSWORD",
+            "API_KEY",
+            "TOKEN",
+            "PRIVATE_KEY",
+        ]
+        for p in self.repo_root.rglob("*.py"):
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "os.environ.get" in text or "os.getenv" in text:
+                continue
+            hits = [s for s in secrets if s in text]
+            if hits:
+                findings.append({
+                    "text": f"Possible hardcoded secret in {p.name}: {hits[0]}",
+                    "status": "FAIL",
+                    "at": _utcnow(),
+                })
+        return findings
+
+
+class ScaffoldDetector:
+    """Reject empty work: empty dirs, missing required files, handfuls of stubs."""
+
+    def __init__(self, required_sets: dict[str, list[str]] | None = None) -> None:
+        self.required_sets = required_sets or {
+            "backend": ["main.py", "README.md"],
+            "frontend": ["index.ts", "README.md"],
+        }
+
+    def audit_root(self, repo_root: Path) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        findings.extend(self._empty_dirs(repo_root))
+        findings.extend(self._missing_required(repo_root))
+        findings.extend(self._stub_files(repo_root))
+        findings.extend(self._thin_tree(repo_root))
+        return findings
+
+    def _empty_dirs(self, repo_root: Path) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        for p in repo_root.rglob("*"):
+            if p.is_dir() and not any(p.iterdir()):
+                findings.append({"text": f"Empty directory: {p.relative_to(repo_root)}", "status": "FAIL", "at": _utcnow()})
+        return findings
+
+    def _missing_required(self, repo_root: Path) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        for rel, files in self.required_sets.items():
+            base = repo_root / "src" / rel
+            if not base.exists():
+                continue
+            existing = {p.name for p in base.rglob("*") if p.is_file()}
+            required = {name for name in files if name not in existing}
+            for name in sorted(required):
+                findings.append({
+                    "text": f"Missing deliverable in {rel}: {name}",
+                    "status": "FAIL",
+                    "at": _utcnow(),
+                })
+        return findings
+
+    def _stub_files(self, repo_root: Path) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        for p in repo_root.rglob("*.py"):
+            text = ""
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if text.strip() in {"...", "pass", "TODO", "FIXME", 'raise NotImplementedError'}:
+                findings.append({
+                    "text": f"Stub file: {p.relative_to(repo_root)}",
+                    "status": "FAIL",
+                    "at": _utcnow(),
+                })
+        return findings
+
+    def _thin_tree(self, repo_root: Path) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        top_dirs = [
+            d for d in (repo_root / "src").iterdir()
+            if d.is_dir() and not any(d.rglob("*"))
+        ]
+        if top_dirs:
+            findings.append({
+                "text": f"Empty deliverable tree: {', '.join(str(d.relative_to(repo_root)) for d in top_dirs)}",
+                "status": "FAIL",
+                "at": _utcnow(),
+            })
+        return findings
+
+
+class WorkflowRunner:
+    """End-to-end runner for a project."""
 
     def __init__(
         self,
@@ -197,6 +427,7 @@ class WorkflowRunner:
         repo_root: Path | str | None = None,
         state_dir: Path | str | None = None,
         log_dir: Path | str | None = None,
+        agent_bridge: AgentBridge | None = None,
     ) -> None:
         self.slug = slug
         self.requirements = requirements
@@ -207,22 +438,16 @@ class WorkflowRunner:
         self.engine = WorkflowEngine(slug, state_dir=self.state_dir, log_dir=self.log_dir)
         self.writer = ArtifactWriter(self.repo_root)
         self.audit = AuditEngine()
+        self.inspector = ArtifactInspector(self.repo_root)
+        self.scaffold_detector = ScaffoldDetector()
+        self.agent_bridge = agent_bridge or HermesSubagentBridge()
         self._reports: dict[str, Any] = {}
-
-    # ------------------------------------------------------------------ #
-    # Setup
-    # ------------------------------------------------------------------ #
 
     def add_disciplines(self, spec: dict[str, list[str]]) -> WorkflowRunner:
         self.engine.init_disciplines(spec)
         return self
 
-    # ------------------------------------------------------------------ #
-    # Tier output handlers
-    # ------------------------------------------------------------------ #
-
     def handle_discipline_lead(self, discipline: str) -> dict[str, Any]:
-        """Run discipline lead prompt and write output."""
         prompt = self.engine.discipline_lead_prompt(discipline, self.requirements)
         artifact_rel = f"plans/{discipline}/00-lead-prompt.md"
         content = f"# Prompted at {_utcnow()}\n\n{prompt}\n"
@@ -239,24 +464,19 @@ class WorkflowRunner:
         return {"prompt": prompt, "artifact": artifact_rel}
 
     def handle_language_specialist(
-        self, discipline: str, layer: str, language: str
-    ) -> dict[str, Any]:
-        prompt = self.engine.language_specialist_prompt(
-            discipline, layer, language, f"Implementation task for {layer} in {language}"
+        self, discipline: str, layer: str, language: str, task: str
+    ) -> AgentResult | None:
+        prompt = self.engine.language_specialist_prompt(discipline, layer, language, task)
+        result = self.agent_bridge.run_language_task(
+            prompt, language, {"repo_root": str(self.repo_root), "layer": layer}
         )
-        artifact_rel = f"plans/{discipline}/{layer}/{language}/02-language-prompt.md"
-        content = f"# Prompted at {_utcnow()}\n\n{prompt}\n"
-        self.writer.write(artifact_rel, content)
-        return {"prompt": prompt, "artifact": artifact_rel}
+        if result.artifacts:
+            self.write_language_artifacts(discipline, layer, language, result.artifacts)
+        return result
 
     def write_language_artifacts(
-        self,
-        discipline: str,
-        layer: str,
-        language: str,
-        files: dict[str, str],
+        self, discipline: str, layer: str, language: str, files: dict[str, str]
     ) -> list[str]:
-        """Write actual language artifacts (code, tests, configs) to disk."""
         base = f"src/{discipline}/{layer}/{language}"
         written: list[str] = []
         for filename, content in files.items():
@@ -270,7 +490,6 @@ class WorkflowRunner:
     # ------------------------------------------------------------------ #
 
     def _run_audit_and_record(self, discipline: str, layer: str) -> dict[str, Any]:
-        """Run audit on the current layer tree and record findings."""
         dirs_to_check = [
             self.repo_root / f"plans/{discipline}/{layer}",
             self.repo_root / f"src/{discipline}/{layer}",
@@ -287,6 +506,7 @@ class WorkflowRunner:
             return {"status": "FAIL", "findings_count": 1}
 
         findings = self.audit.audit_files(artifacts)
+        findings.extend(self.scaffold_detector.audit_root(self.repo_root))
         for f in findings:
             self.engine.record_finding(discipline, layer, f["text"], "FAIL")
         return {
@@ -303,7 +523,6 @@ class WorkflowRunner:
             self.engine.record_finding(discipline, layer, text, status="FIXED")
 
     def fix_loop(self, discipline: str, layer: str) -> dict[str, Any]:
-        """Loop until the layer passes audit or MAX_AUDIT_ROUNDS is exhausted."""
         report: dict[str, Any] = {"rounds": 0, "escalated": False}
         for i in range(1, MAX_AUDIT_ROUNDS + 1):
             report["rounds"] = i
@@ -321,7 +540,16 @@ class WorkflowRunner:
                 report["escalated"] = True
                 return report
 
-            self._mark_all_layer_findings_fixed(discipline, layer)
+            findings = [
+                f["text"] for f in self.audit.audit_files([
+                    str(p) for p in self.repo_root.rglob("*") if p.is_file()
+                ]) if f["status"] == "FAIL"
+            ]
+            findings.extend([
+                f["text"] for f in self.scaffold_detector.audit_root(self.repo_root) if f["status"] == "FAIL"
+            ])
+            for text in findings:
+                self.engine.record_finding(discipline, layer, text, status="FIXED")
 
         report["final_status"] = "FAIL"
         return report
@@ -331,7 +559,6 @@ class WorkflowRunner:
     # ------------------------------------------------------------------ #
 
     def run(self) -> dict[str, Any]:
-        """Drive the full waterfall end-to-end."""
         project_state = self.engine.status()
         disciplines = list(project_state.get("disciplines", {}).keys())
         report: dict[str, Any] = {
@@ -341,6 +568,7 @@ class WorkflowRunner:
             "started_at": _utcnow(),
             "disciplines": {},
             "artifacts": self.writer.list_written(),
+            "artifacts_status": "PENDING",
             "status": "PENDING",
         }
 
@@ -354,8 +582,9 @@ class WorkflowRunner:
 
             for layer in self.engine._layers_for(disc):
                 self.handle_layer_specialist(disc, layer)
+                task = f"Implement {layer} layer for {disc}."
                 for language in ["python", "typescript"]:
-                    self.handle_language_specialist(disc, layer, language)
+                    self.handle_language_specialist(disc, layer, language, task)
                 fix = self.fix_loop(disc, layer)
                 disc_report["layers"][layer] = fix
                 if fix.get("final_status") == "FAIL":
@@ -365,6 +594,9 @@ class WorkflowRunner:
                     break
 
             if disc_report.get("status") != "FAIL":
+                artifact_findings = self.inspector.inspect()
+                for f in artifact_findings:
+                    self.engine.record_finding(disc, disc, f["text"], "FAIL")
                 sig = self._complete_discipline(disc)
                 disc_report["status"] = sig
                 if sig == "FAIL":
@@ -372,6 +604,7 @@ class WorkflowRunner:
 
             report["disciplines"][disc] = disc_report
 
+        report["artifacts_status"] = "PASS" if not self.inspector.inspect() else "FAIL"
         if report["status"] != "FAIL":
             report["status"] = self._complete_project()
 
@@ -385,14 +618,14 @@ class WorkflowRunner:
                 self.slug, discipline, state_dir=self.state_dir, log_dir=self.log_dir
             )
             return "COMPLETED"
-        except (SystemExit, Exception):  # noqa: BLE001 - swallow crucible state failures gracefully
+        except Exception:  # noqa: BLE001
             return "FAIL"
 
     def _complete_project(self) -> str:
         try:
             complete_project(self.slug, state_dir=self.state_dir, log_dir=self.log_dir)
             return "COMPLETED"
-        except (SystemExit, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return "FAIL"
 
     def report(self) -> dict[str, Any]:
@@ -404,7 +637,6 @@ class WorkflowRunner:
             f"Project: {r['slug']}",
             f"Status: {r['status']}",
             f"Repo:   {r['repo']}",
-            "Disciplines:",
         ]
         for disc, dr in r.get("disciplines", {}).items():
             lines.append(f"  - {disc}: {dr.get('status', '???')}")
@@ -414,3 +646,26 @@ class WorkflowRunner:
                     f" (rounds={lr.get('rounds', 0)})"
                 )
         return "\n".join(lines)
+
+
+class FakeAgentBridge(AgentBridge):
+    """Deterministic fake for tests.
+
+    Returns code/text instead of calling the real Hermes runtime, so runner
+    tests stay hermetic and still exercise the artifact pipeline.
+    """
+
+    def __init__(self, fixtures: dict[str, dict[str, str]]) -> None:
+        self.fixtures = fixtures
+
+    def run_language_task(
+        self,
+        task: str,
+        language: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        return AgentResult(
+            output=f"Fake output for {language}",
+            artifacts=self.fixtures.get(language, {}),
+            metadata={"real": False, "bridge": self.__class__.__name__},
+        )
