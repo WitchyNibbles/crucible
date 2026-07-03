@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "crucible"
+version = "0.1.0"
+description = "Audit-driven autonomous software development workflow"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Samantha", email = "sam@crucible.dev"},
+]
+readme = "README.md"
+keywords = ["autonomous", "multi-agent", "development", "audit", "waterfall"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Engineering",
+]
+dependencies = []
+
+[project.scripts]
+crucible = "crucible.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crucible*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
