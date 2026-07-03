@@ -4,7 +4,8 @@ Public API:
     from crucible import init, list_projects
     from crucible import add_discipline, set_layer_done, add_finding
     from crucible import complete_discipline, complete_project
-    from crucible import WorkflowEngine
+    from crucible.engine import WorkflowEngine
+    from crucible.runner import ArtifactWriter, AuditEngine, WorkflowRunner
 """
 
 from __future__ import annotations
@@ -398,5 +399,6 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
