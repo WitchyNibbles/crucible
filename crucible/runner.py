@@ -77,9 +77,16 @@ class AgentBridge:
 
 
 class HermesSubagentBridge(AgentBridge):
-    """Real Hermes execution using Hermes subagent runner."""
+    """Real Hermes execution via an injected delegate callable."""
 
-    def __init__(self, deploy_hints: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        delegate_fn = None,  # Callable[[str, str, dict[str, Any]], AgentResult]
+        deploy_hints: list[str] | None = None,
+    ) -> None:
+        if delegate_fn is None:
+            raise ValueError("HermesSubagentBridge requires a `delegate_fn` callable")
+        self.delegate_fn = delegate_fn
         self.deploy_hints = deploy_hints or []
 
     def run_language_task(
@@ -88,15 +95,7 @@ class HermesSubagentBridge(AgentBridge):
         language: str,
         context: dict[str, Any],
     ) -> AgentResult:
-        report: AgentResult = AgentResult(
-            output="",
-            artifacts={
-                f"{language}/impl.py": "raise NotImplementedError('delegate bridge not connected')\n",
-                f"{language}/README.md": "TODO: implementation pending\n",
-            },
-            metadata={"real": False, "bridge": self.__class__.__name__},
-        )
-        return report
+        return self.delegate_fn(task, language, context)
 
 
 class ArtifactWriter:
@@ -404,8 +403,11 @@ class ScaffoldDetector:
 
     def _thin_tree(self, repo_root: Path) -> list[dict[str, str]]:
         findings: list[dict[str, str]] = []
+        src = repo_root / "src"
+        if not src.exists() or not src.is_dir():
+            return findings
         top_dirs = [
-            d for d in (repo_root / "src").iterdir()
+            d for d in src.iterdir()
             if d.is_dir() and not any(d.rglob("*"))
         ]
         if top_dirs:
@@ -440,7 +442,7 @@ class WorkflowRunner:
         self.audit = AuditEngine()
         self.inspector = ArtifactInspector(self.repo_root)
         self.scaffold_detector = ScaffoldDetector()
-        self.agent_bridge = agent_bridge or HermesSubagentBridge()
+        self.agent_bridge = agent_bridge or FakeAgentBridge({})
         self._reports: dict[str, Any] = {}
 
     def add_disciplines(self, spec: dict[str, list[str]]) -> WorkflowRunner:
