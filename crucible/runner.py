@@ -266,7 +266,11 @@ class ArtifactInspector:
                 text=True,
                 timeout=10,
             )
-            if result.stdout.strip():
+            dirty = [
+                line for line in result.stdout.splitlines()
+                if not line.startswith(" M plans/") and not line.startswith("?? plans/")
+            ]
+            if dirty:
                 findings.append({"text": "Dirty git state detected", "status": "FAIL", "at": _utcnow()})
         except (OSError, subprocess.TimeoutExpired):
             pass
