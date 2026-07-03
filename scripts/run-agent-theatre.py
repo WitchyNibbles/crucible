@@ -1,18 +1,10 @@
-"""Run Crucible end-to-end on agent-theatre."""
+"""Launch and inspect the agent-theatre Crucible delivery."""
 from pathlib import Path
-from crucible import init
 from crucible.runner import WorkflowRunner, FakeAgentBridge
 
 fixtures = {
     "python": {
-        "app.py": '''"""
-Agent Theatre Flask app.
-
-Characters
-  - 🧠 Ivy (Researcher) heads to the library
-  - 💻 Bolt (Engineer) heads to the computer
-  - 🎭 Vera (Explainer) heads to the theatre
-"""
+        "app.py": '''"""Agent Theatre Flask app."""
 from __future__ import annotations
 
 from flask import Flask, jsonify, render_template
@@ -41,11 +33,12 @@ if __name__ == "__main__":
 ''',
         "routes.py": '''"""Routes for agent status."""
 from __future__ import annotations
+
 from agent_theatre.app import app
 
 
 @app.get("/api/agents/<agent_id>/move")
-def move(agent_id: str):  # pragma: no cover
+def move(agent_id: str):
     return {"ok": True}
 ''',
         "load_agents.py": '''"""Load agent state."""
@@ -55,7 +48,7 @@ from __future__ import annotations
 def load_agents():
     return [
         {"id": "researcher", "name": "Ivy", "emoji": "🧠"},
-        {"id": "engineer", "name": "Bolt", "emoji": "💻"},
+        {"id": "engineer",  "name": "Bolt", "emoji": "💻"},
         {"id": "explainer", "name": "Vera", "emoji": "🎭"},
     ]
 ''',
@@ -74,24 +67,12 @@ repo_root = Path("/home/eimi/projects/agent-theatre")
 state_dir = Path("/home/eimi/.crucible/state")
 log_dir = Path("/home/eimi/.crucible/log")
 
-try:
-    init("agent-theatre", name="Agent Theatre", state_dir=state_dir, log_dir=log_dir, repo_root=repo_root)
-except SystemExit:
-    pass
-
 for stale in [
     repo_root / "src/agent_theatre/templates",
     repo_root / "src/agent_theatre/static",
 ]:
-    if stale.exists():
-        if stale.is_dir() and not any(stale.iterdir()):
-            stale.rmdir()
-
-try:
-    import sys
-    print("[DEBUG run] repo files:", sorted(str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()), file=sys.stderr)
-except Exception:
-    pass
+    if stale.exists() and stale.is_dir() and not any(stale.iterdir()):
+        stale.rmdir()
 
 runner = WorkflowRunner(
     "agent-theatre",
@@ -104,4 +85,11 @@ runner = WorkflowRunner(
 runner.add_disciplines({
     "engineering": ["backend", "frontend", "qa"],
 })
-print(runner.run())
+
+report = runner.run()
+print(report)
+
+app_py = repo_root / "src" / "engineering" / "backend" / "python" / "app.py"
+print("app.py exists:", app_py.exists())
+if app_py.exists():
+    print(app_py.read_text())

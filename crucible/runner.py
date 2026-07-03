@@ -520,8 +520,6 @@ class WorkflowRunner:
 
         findings = self.audit.audit_files(artifacts)
         findings.extend(self.scaffold_detector.audit_root(self.repo_root))
-        import sys
-        print("[DEBUG findings]", findings, file=sys.stderr)
         for f in findings:
             self.engine.record_finding(discipline, layer, f["text"], "FAIL")
         return {
@@ -619,13 +617,12 @@ class WorkflowRunner:
 
             report["disciplines"][disc] = disc_report
 
-        report["artifacts_status"] = "PASS" if not self.inspector.inspect() else "FAIL"
-        if report["status"] in ("PENDING", "COMPLETED"):
+        report["artifacts_status"] = "PENDING"
+        if report["status"] not in ("FAIL",):
             self._commit_artifacts()
             report["artifacts_status"] = "PASS" if not self.inspector.inspect() else "FAIL"
             if report["artifacts_status"] == "PASS" and report["status"] != "FAIL":
-                for disc in disciplines:
-                    self._reopen_and_clear_resolved(disc)
+                self._clear_postcommit_dirty_states(disciplines)
                 report["status"] = self._complete_project()
 
         report["finished_at"] = _utcnow()
@@ -664,22 +661,44 @@ class WorkflowRunner:
         except (OSError, subprocess.TimeoutExpired):
             pass
 
-    def _reopen_and_clear_resolved(self, discipline: str) -> None:
-        state = load(self.slug, state_dir=self.state_dir)
-        disc_state = state.setdefault("disciplines", {}).setdefault(discipline, {})
-        for finding in disc_state.get("findings", []):
-            if finding.get("status") != "FAIL":
+    def _clear_postcommit_dirty_states(self, disciplines) -> None:
+        for discipline in disciplines:
+            state = load(self.slug, state_dir=self.state_dir)
+            disc_state = state.setdefault("disciplines", {}).setdefault(discipline, {})
+            findings = disc_state.get("findings", [])
+            if not findings:
                 continue
-            text = finding.get("text", "")
-            if text == "Dirty git state detected":
-                finding["status"] = "FIXED"
-                continue
-            if "Empty directory:" in text:
-                p = (self.repo_root / text.split("Empty directory:", 1)[1].strip())
-                if p.exists() and any(p.iterdir()):
-                    finding["status"] = "FIXED"
+
+            clean = False
+            git_dir = self.repo_root / ".git"
+            if git_dir.exists():
+                try:
+                    result = subprocess.run(
+                        ["git", "-C", str(self.repo_root), "status", "--porcelain"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    clean = not result.stdout.strip()
+                except (OSError, subprocess.TimeoutExpired):
+                    clean = False
+
+            changed = False
+            for finding in findings:
+                if finding.get("status") != "FAIL":
                     continue
-        save(self.slug, state, state_dir=self.state_dir, log_dir=self.log_dir)
+                text = finding.get("text", "") or ""
+                if text == "Dirty git state detected" and clean:
+                    finding["status"] = "FIXED"
+                    changed = True
+                elif "Empty directory:" in text:
+                    rel = text.split("Empty directory:", 1)[1].strip()
+                    resolved = (self.repo_root / rel).exists() and any((self.repo_root / rel).iterdir())
+                    if resolved:
+                        finding["status"] = "FIXED"
+                        changed = True
+            if changed:
+                save(self.slug, state, state_dir=self.state_dir, log_dir=self.log_dir)
 
     def summary(self) -> str:
         r = self.report()
