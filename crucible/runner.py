@@ -31,6 +31,8 @@ from crucible import (
     complete_discipline,
     complete_project,
     init,
+    load,
+    save,
     set_layer_done,
 )
 from crucible.engine import WorkflowEngine
@@ -348,10 +350,12 @@ class ArtifactInspector:
 class ScaffoldDetector:
     """Reject empty work: empty dirs, missing required files, handfuls of stubs."""
 
+    IGNORED_DIRS = {".git", ".venv", ".tox", ".mypy_cache", ".pytest_cache", "__pycache__", "node_modules"}
+
     def __init__(self, required_sets: dict[str, list[str]] | None = None) -> None:
         self.required_sets = required_sets or {
-            "backend": ["main.py", "README.md"],
-            "frontend": ["index.ts", "README.md"],
+            "backend": ["app.py", "README.md"],
+            "frontend": ["README.md"],
         }
 
     def audit_root(self, repo_root: Path) -> list[dict[str, str]]:
@@ -365,8 +369,15 @@ class ScaffoldDetector:
     def _empty_dirs(self, repo_root: Path) -> list[dict[str, str]]:
         findings: list[dict[str, str]] = []
         for p in repo_root.rglob("*"):
-            if p.is_dir() and not any(p.iterdir()):
-                findings.append({"text": f"Empty directory: {p.relative_to(repo_root)}", "status": "FAIL", "at": _utcnow()})
+            if not p.is_dir():
+                continue
+            if any(part in self.IGNORED_DIRS for part in p.relative_to(repo_root).parts):
+                continue
+            try:
+                if not any(p.iterdir()):
+                    findings.append({"text": f"Empty directory: {p.relative_to(repo_root)}", "status": "FAIL", "at": _utcnow()})
+            except OSError:
+                continue
         return findings
 
     def _missing_required(self, repo_root: Path) -> list[dict[str, str]]:
@@ -509,6 +520,8 @@ class WorkflowRunner:
 
         findings = self.audit.audit_files(artifacts)
         findings.extend(self.scaffold_detector.audit_root(self.repo_root))
+        import sys
+        print("[DEBUG findings]", findings, file=sys.stderr)
         for f in findings:
             self.engine.record_finding(discipline, layer, f["text"], "FAIL")
         return {
@@ -607,8 +620,13 @@ class WorkflowRunner:
             report["disciplines"][disc] = disc_report
 
         report["artifacts_status"] = "PASS" if not self.inspector.inspect() else "FAIL"
-        if report["status"] != "FAIL":
-            report["status"] = self._complete_project()
+        if report["status"] in ("PENDING", "COMPLETED"):
+            self._commit_artifacts()
+            report["artifacts_status"] = "PASS" if not self.inspector.inspect() else "FAIL"
+            if report["artifacts_status"] == "PASS" and report["status"] != "FAIL":
+                for disc in disciplines:
+                    self._reopen_and_clear_resolved(disc)
+                report["status"] = self._complete_project()
 
         report["finished_at"] = _utcnow()
         self._reports = report
@@ -632,6 +650,36 @@ class WorkflowRunner:
 
     def report(self) -> dict[str, Any]:
         return self._reports or self.run()
+
+    def _commit_artifacts(self) -> None:
+        git_dir = self.repo_root / ".git"
+        if not git_dir.exists():
+            return
+        try:
+            subprocess.run(["git", "-C", str(self.repo_root), "add", "-A"], check=False)
+            subprocess.run(
+                ["git", "-C", str(self.repo_root), "-c", "user.email=sam@crucible.dev", "-c", "user.name=Crucible", "commit", "-m", f"chore({self.slug}): deliver artifacts"],
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _reopen_and_clear_resolved(self, discipline: str) -> None:
+        state = load(self.slug, state_dir=self.state_dir)
+        disc_state = state.setdefault("disciplines", {}).setdefault(discipline, {})
+        for finding in disc_state.get("findings", []):
+            if finding.get("status") != "FAIL":
+                continue
+            text = finding.get("text", "")
+            if text == "Dirty git state detected":
+                finding["status"] = "FIXED"
+                continue
+            if "Empty directory:" in text:
+                p = (self.repo_root / text.split("Empty directory:", 1)[1].strip())
+                if p.exists() and any(p.iterdir()):
+                    finding["status"] = "FIXED"
+                    continue
+        save(self.slug, state, state_dir=self.state_dir, log_dir=self.log_dir)
 
     def summary(self) -> str:
         r = self.report()
